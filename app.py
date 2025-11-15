@@ -3,6 +3,7 @@ import streamlit as st
 import pandas as pd
 import yfinance as yf
 import plotly.graph_objects as go
+import datetime as dt
 from plotly.subplots import make_subplots
 from full_fred.fred import Fred
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -14,9 +15,9 @@ os.environ["FRED_API_KEY"] = "c716130f701440f2f42a576d781f767d"
 fred = Fred()  # FRED_API_KEY を環境変数から読む
 
 # --- デフォルト設定 ---
-DEFAULT_STOCK_TICKERS = ["VTI", "VXUS", "QYLD", "URTH", "VDE", "CPER", "GLD", "AAPL", "KO"]
-DEFAULT_INDEX_TICKERS_YF = ["^VIX", "EEM/EFA", "^IXIC", "^DJI", "1592.T", "^N500"]
-DEFAULT_INDEX_FRED = ["SP500", "UNRATE", "T10Y2Y", "MEDCPIM158SFRBCLE", "DFEDTARU"]
+DEFAULT_STOCK_TICKERS = ["VTI", "VXUS", "QYLD", "URTH", "VDE", "VDC", "CPER", "GLD"]
+DEFAULT_INDEX_TICKERS_YF = ["^VIX", "EEM/EFA", "^GSPC", "^IXIC", "^DJI", "1592.T", "^N500"]
+DEFAULT_INDEX_FRED = ["UNRATE", "T10Y2Y", "MEDCPIM158SFRBCLE", "DFEDTARU"]
 
 # YTD 用
 YTD_TICKERS = ["EPOL", "VNM", "EWW", "MCHI", "ECH", "EWZ", "EWG", "VXUS", "SPY", "EPI", "EWJ"]
@@ -73,7 +74,8 @@ INDEX_DESCRIPTION_MAP = {
     "DFEDTARU": "Fed Funds Upper Target",
     "^IXIC": "Nasdaq",
     "^DJI": "Dow",
-    "CPER": "Copper"
+    "CPER": "Copper",
+    "^GSPC": "SP500"
     # 必要に応じて追加
 }
 
@@ -615,6 +617,132 @@ def build_ytd_figure() -> go.Figure | None:
     )
     return fig
 
+
+# =====================================
+#  YTD 線グラフ
+# =====================================
+def build_ytd_year_figure() -> go.Figure | None:
+    # -----------------------------
+    # 2. 対象となる過去10年間（フルイヤー）＋ 今年(YTD)
+    #    例：今が2025年なら 2015〜2024年がフルイヤー,
+    #        2025年は年初〜今日までのYTD
+    # -----------------------------
+    today = dt.date.today()
+    current_year = today.year
+
+    start_year = current_year - 10        # 10年前の年（フルイヤーの最初）
+    end_year = current_year - 1           # 直近のフルイヤーの最後
+    years_full = list(range(start_year, end_year + 1))
+
+    records = []
+
+    # -----------------------------
+    # 3-1. フルイヤーの年次リターン計算（〜昨年まで）
+    # -----------------------------
+    for ticker in YTD_TICKERS:
+        for year in years_full:
+            year_start = f"{year}-01-01"
+            year_end   = f"{year + 1}-01-01"  # 翌年の1/1まで取得して、その直前が年末
+
+            data = yf.download(ticker, start=year_start, end=year_end, progress=False)
+
+            # データ不足の場合はスキップ
+            if len(data) < 2:
+                print(f"{ticker} の {year} 年のデータが不足しています")
+                continue
+
+            open_price = data.iloc[0]["Open"]     # 年初の営業日の始値
+            close_price = data.iloc[-1]["Close"]  # 年末の営業日の終値
+            annual_return = float((close_price / open_price - 1) * 100)
+
+            records.append({
+                "Year": year,
+                "Ticker": ticker,
+                "Country": COUNTRY_MAP_YTD[ticker],
+                "Return(%)": annual_return
+            })
+
+    # -----------------------------
+    # 3-2. 今年のYTDリターン計算
+    #      年初(1/1以降の最初の営業日)〜「現在まで」の成長率
+    # -----------------------------
+    ytd_start = dt.date(current_year, 1, 1).isoformat()
+    # yfinance の end は「その前日」まで取得なので、今日の翌日を指定
+    ytd_end = (today + dt.timedelta(days=1)).isoformat()
+
+    for ticker in YTD_TICKERS:
+        data = yf.download(ticker, start=ytd_start, end=ytd_end, progress=False)
+
+        if len(data) < 2:
+            print(f"{ticker} の {current_year} 年(YTD)のデータが不足しています")
+            continue
+
+        open_price = data.iloc[0]["Open"]     # 今年最初の営業日の始値
+        close_price = data.iloc[-1]["Close"]  # 現在時点での直近営業日の終値
+        ytd_return = float((close_price / open_price - 1) * 100)
+
+        records.append({
+            "Year": current_year,
+            "Ticker": ticker,
+            "Country": COUNTRY_MAP_YTD[ticker],
+            "Return(%)": ytd_return
+        })
+
+    # -----------------------------
+    # 4. 長い形式の DataFrame & 国ごとのピボット
+    # -----------------------------
+    df_long = pd.DataFrame(records)
+
+    # 国ごとの成長率テーブル（行：Year, 列：Country）
+    df_country = df_long.pivot_table(
+        index="Year",
+        columns="Country",
+        values="Return(%)"
+    ).sort_index()
+
+    print("=== 国ごとの年次リターン DataFrame ===")
+    print(df_country)
+
+    # -----------------------------
+    # 5. Plotly ドット＋線グラフ作成
+    #    （各国ごとに lines+markers で比較）
+    # -----------------------------
+    fig = go.Figure()
+
+    # 国ごとに線を引く
+    for country in sorted(df_long["Country"].unique()):
+        country_data = df_long[df_long["Country"] == country].sort_values("Year")
+
+        # SPY(USA)だけ色を変えたい場合
+        if country == "USA":
+            line_color = "red"
+        else:
+            line_color = None  # Plotly におまかせ
+
+        fig.add_trace(
+            go.Scatter(
+                x=country_data["Year"],
+                y=country_data["Return(%)"],
+                mode="lines+markers",          # ドット＋線
+                name=country,
+                line=dict(color=line_color) if line_color else None
+            )
+        )
+
+    fig.update_layout(
+        title=f"Annual Returns by Country ({start_year}–{current_year}) "
+            f"(Last year: full-year, {current_year}: YTD)",
+        xaxis_title="Year",
+        yaxis_title="Return (%)",
+        template="plotly_white",
+        hovermode="x unified",
+        legend_title="Country",
+        margin=dict(l=40, r=40, t=80, b=40),
+    )
+
+    return fig
+
+
 # =====================================
 #  並列処理用ヘルパー（Stocks / Indexes）
 # =====================================
@@ -643,7 +771,7 @@ def _load_index_ohlcv(idx_ticker: str):
 # =====================================
 def main():
     st.set_page_config(
-        page_title="Stock & Index Viewer with Interval-based MAs",
+        page_title="StockDash",
         layout="wide",
     )
 
@@ -728,7 +856,7 @@ def main():
     # 元の tickers の順番にソートして表示順を維持
     stock_results.sort(key=lambda x: tickers.index(x[0]))
 
-    n_cols = 3
+    n_cols = 4
     chart_idx = 0
     cols = None
 
@@ -789,7 +917,7 @@ def main():
         # 表示順維持
         idx_results.sort(key=lambda x: index_tickers.index(x[0]))
 
-    n_cols_idx = 3
+    n_cols_idx = n_cols
     idx_chart = 0
     cols_idx = None
 
@@ -858,10 +986,13 @@ def main():
     st.markdown("## その他")
 
     fig_ytd = build_ytd_figure()
+    fig_ytd_year = build_ytd_year_figure()
     if fig_ytd is not None:
-        misc_cols = st.columns(3)
-        with misc_cols[0]:
+        col_left, col_right = st.columns([1, 2])
+        with col_left:
             st.plotly_chart(fig_ytd, use_container_width=True)
+        with col_right:
+            st.plotly_chart(fig_ytd_year, use_container_width=True)
     else:
         st.info("その他のYTDパフォーマンスを計算できるデータがありませんでした。")
 
