@@ -9,9 +9,6 @@ from full_fred.fred import Fred
 # ------------------------
 # FRED 設定＆ヘルパー
 # ------------------------
-# ★ここで FRED_API_KEY を環境変数にセットしておくか、
-#   事前にシェルや .env などで設定しておいてください。
-#   例: export FRED_API_KEY="YOUR_FRED_API_KEY"
 os.environ["FRED_API_KEY"] = "c716130f701440f2f42a576d781f767d"
 fred = Fred()  # FRED_API_KEY を環境変数から読む
 
@@ -64,23 +61,19 @@ st.set_page_config(page_title="Stock & Index Viewer with Interval-based MAs", la
 st.sidebar.header("Stock Controls")
 
 # デフォルトの Ticker（株）
-default_tickers = ["VTI", "VXUS", "GLD", "VDE", "QYLD", "EWJ", "URTH"]
+default_tickers = ["VTI", "VXUS", "GLD", "VDE", "QYLD", "EWJ", "URTH", "ECH"]
 
 # デフォルトのインデックス Ticker (yfinance 側)
-# ・^VIX：ボラティリティ指数
-# ・EEM/EFA：EEM / EFA の比率を疑似インデックスとして表示
 default_index_tickers = ["^VIX", "EEM/EFA", "1592.T", "^N500"]
 
 # デフォルトのインデックス（FRED 系列）
-# ここに "VIXCLS", "SP500" などの FRED シリーズIDを入れると
-# 「Indexes」グラフにデフォルトで追加されます。
 default_index_fred = ["SP500", "UNRATE", "T10Y2Y", "MEDCPIM158SFRBCLE", "DFEDTARU"]
 
 # グラフの数 n（株価用）
 n_charts = st.sidebar.number_input(
     "Number of stock tickers (n)",
     min_value=1,
-    max_value=6,
+    #max_value=6,
     value=6,        # デフォルト
     step=1,
 )
@@ -124,9 +117,6 @@ if not tickers:
 # インデックス用コントロール
 # ------------------------
 st.sidebar.header("Index Controls")
-
-# ★ 期間指定は x_range_choice を流用するので
-#    Index 用の別ラジオボタンは削除
 
 n_index_extra = st.sidebar.number_input(
     "Number of additional index tickers",
@@ -180,9 +170,24 @@ def load_stock_per(ticker_symbol: str):
     # または前方予想P/Eを取得
     forward_pe = info.get("forwardPE")
 
-    print("Trailing P/E:", pe_ratio)
-    print("Forward P/E:", forward_pe)
+    print('pe_ratio:', pe_ratio)
     return pe_ratio
+
+@st.cache_data
+def load_stock_eps(ticker_symbol: str):
+    ticker = yf.Ticker(ticker_symbol)
+    info = ticker.info
+
+    # EPS（Trailing EPS = 過去12か月の実績）
+    eps_trailing = info.get("trailingEps")
+
+    # 予想EPS（Forward EPS）
+    eps_forward = info.get("forwardEps")
+
+    print(ticker_symbol)
+    print('eps:', eps_trailing)
+    print('for eps:', eps_forward)
+    return eps_trailing
 
 @st.cache_data
 def load_ratio_df_eem_efa() -> pd.DataFrame:
@@ -323,6 +328,7 @@ def build_figure(
     df_input: pd.DataFrame,
     label: str,
     per,
+    eps,
     base_range_choice: str,
     show_volume: bool = True,
     show_per_in_title: bool = True,
@@ -523,7 +529,7 @@ def build_figure(
             plot_bgcolor="white",
             paper_bgcolor="white",
             margin=dict(l=0, r=0, t=0, b=0),
-            height=250,
+            height=200,
         )
 
     # x軸レンジ（初期表示だけ制限、データ自体は全期間）
@@ -543,7 +549,9 @@ def build_figure(
 
     # タイトル文字列
     if show_per_in_title:
-        if per is not None:
+        if per is not None and eps is not None:
+            title_text = f"{label} PER:{per:.1f} EPS:{eps:.1f}"
+        elif per is not None and eps is None:
             title_text = f"{label} PER:{per:.1f}"
         else:
             title_text = f"{label} PER:NA"
@@ -581,6 +589,7 @@ cols = None
 for ticker in tickers:
     stock_df = load_stock_df(ticker)
     per = load_stock_per(ticker)
+    eps = load_stock_eps(ticker)
 
     if stock_df.empty:
         st.error(f"{ticker}: データが取得できませんでした。Ticker シンボルを確認してください。")
@@ -590,6 +599,7 @@ for ticker in tickers:
         stock_df,
         ticker,
         per,
+        eps,
         base_range_choice=x_range_choice,  # ★共通期間設定を使用
         show_volume=True,
         show_per_in_title=True,   # 株価：PER をタイトルに表示
@@ -636,6 +646,7 @@ for idx_ticker in index_tickers:
         df_idx,
         idx_ticker,
         per=None,
+        eps=None,
         base_range_choice=x_range_choice,  # ★Stocks と同じ期間設定を使用
         show_volume=False,          # インデックス：出来高を表示しない（＝line表示）
         show_per_in_title=False,    # インデックス：タイトルはシンボルのみ
@@ -663,6 +674,7 @@ for fred_series in default_index_fred:
         df_fred,
         fred_series,
         per=None,
+        eps=None,
         base_range_choice=x_range_choice,  # ★共通期間設定
         show_volume=False,          # インデックス：出来高なし
         show_per_in_title=False,    # タイトルはシリーズIDのみ
@@ -678,3 +690,83 @@ for fred_series in default_index_fred:
         st.plotly_chart(fig_fred, use_container_width=True)
 
     idx_chart += 1
+
+# ------------------------
+# 「その他」：YTD 棒グラフ（サンプルコードのグラフ）
+# ------------------------
+st.markdown("## その他")
+
+# 対象ETF ＆ 国名略称マップ（サンプルコードと同じ）
+ytd_tickers = ["EPOL", "VNM", "EWW", "MCHI", "ECH", "EWZ", "EWG", "VXUS", "SPY", "EPI", "EWJ"]
+
+country_map_ytd = {
+    "EPOL": "POL",   # Poland
+    "VNM": "VNM",    # Vietnam
+    "EWW": "MEX",    # Mexico
+    "MCHI": "CHN",   # China
+    "ECH": "CHL",    # Chile
+    "EWZ": "BRA",    # Brazil
+    "EWG": "GER",    # Germany
+    "VXUS": "INTL",  # International ex-US
+    "SPY": "USA",    # United States
+    "EPI": "IND",    # India
+    "EWJ": "JPN",    # Japan
+}
+
+year_start_ytd = "2025-01-01"
+ytd_results = []
+
+for ticker in ytd_tickers:
+    data = yf.download(ticker, start=year_start_ytd)
+
+    if len(data) < 2:
+        st.warning(f"{ticker} のYTD計算に必要なデータが不足しています")
+        continue
+
+    open_price = data.iloc[0]["Open"]
+    current_price = data.iloc[-1]["Close"]
+    ytd_val = float((current_price / open_price - 1) * 100)
+
+    ytd_results.append({
+        "Ticker": ticker,
+        "YTD": ytd_val,
+        "Country": country_map_ytd[ticker],
+    })
+
+if ytd_results:
+    df_ytd = pd.DataFrame(ytd_results)
+    df_ytd = df_ytd.sort_values("YTD", ascending=False)
+
+    # x軸ラベル（2段構成：Ticker + 国名略称）
+    x_labels_ytd = [f"{t}<br>{c}" for t, c in zip(df_ytd["Ticker"], df_ytd["Country"])]
+
+    # 色付け（SPYだけ赤）
+    colors_ytd = ["red" if t == "SPY" else "#1f567d" for t in df_ytd["Ticker"]]
+
+    fig_ytd = go.Figure(
+        data=[
+            go.Bar(
+                x=x_labels_ytd,
+                y=df_ytd["YTD"],
+                marker_color=colors_ytd,
+                text=[f"{y:.2f}%" for y in df_ytd["YTD"]],
+                textposition="outside",
+            )
+        ]
+    )
+
+    fig_ytd.update_layout(
+        title="Year-to-Date Performance (YTD)",
+        yaxis_title="YTD (%)",
+        template="plotly_white",
+        xaxis_tickfont=dict(size=12),
+        margin=dict(l=40, r=40, t=80, b=50),
+        height=400,
+    )
+
+    # ここも 3 列レイアウトにして、その 1 列目に棒グラフを表示
+    misc_cols = st.columns(3)
+    with misc_cols[0]:
+        st.plotly_chart(fig_ytd, use_container_width=True)
+else:
+    st.info("その他のYTDパフォーマンスを計算できるデータがありませんでした。")
