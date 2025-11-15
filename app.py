@@ -3,75 +3,26 @@ import streamlit as st
 import pandas as pd
 import yfinance as yf
 import plotly.graph_objects as go
+import datetime as dt
 from plotly.subplots import make_subplots
 from full_fred.fred import Fred
 
-# ------------------------
-# FRED 設定＆ヘルパー
-# ------------------------
-os.environ["FRED_API_KEY"] = "c716130f701440f2f42a576d781f767d"
+# ============================================================
+# 0. 定数・グローバル設定
+# ============================================================
+
+# ---- FRED 設定 ----
+FRED_API_KEY = "c716130f701440f2f42a576d781f767d"
+os.environ["FRED_API_KEY"] = FRED_API_KEY
 fred = Fred()  # FRED_API_KEY を環境変数から読む
 
-def get_fred_data(name, start="2013-01-01", end=""):
-    """
-    サンプルコードと同じ形式で FRED の時系列を取得する。
-    index: date, column: 'value'
-    """
-    df = fred.get_series_df(name)[["date", "value"]].copy()
-    df["date"] = pd.to_datetime(df["date"])
-    df["value"] = pd.to_numeric(df["value"], errors="coerce")
-    df = df.set_index("date")
+# ---- デフォルト Ticker 設定 ----
+DEFAULT_STOCK_TICKERS = ["VTI", "VXUS", "QYLD", "URTH", "VDE", "VDC", "CPER", "GLD"]
+DEFAULT_INDEX_TICKERS_YF = ["^VIX", "EEM/EFA", "^GSPC", "^IXIC", "^DJI", "1592.T", "^N500"]
+DEFAULT_INDEX_TICKERS_FRED = ["UNRATE", "T10Y2Y", "MEDCPIM158SFRBCLE", "DFEDTARU"]
 
-    if end == "":
-        df = df.loc[f"{start}":]
-    else:
-        df = df.loc[f"{start}":f"{end}"]
-    return df
-
-@st.cache_data
-def load_fred_ohlcv(series_id: str, start="2013-01-01", end=""):
-    """
-    FRED の 'value' 時系列を、擬似 OHLCV に変換する。
-    Open = High = Low = Close = value, Volume = 0
-    として Index グラフ用に使う。
-    """
-    df_val = get_fred_data(series_id, start=start, end=end)
-    if df_val is None or df_val.empty:
-        return pd.DataFrame()
-
-    if "value" not in df_val.columns:
-        return pd.DataFrame()
-
-    ohlcv = pd.DataFrame(index=df_val.index)
-    ohlcv["Open"] = df_val["value"]
-    ohlcv["High"] = df_val["value"]
-    ohlcv["Low"] = df_val["value"]
-    ohlcv["Close"] = df_val["value"]
-    ohlcv["Volume"] = 0.0
-    return ohlcv
-
-# ------------------------
-# Streamlit ページ設定
-# ------------------------
-st.set_page_config(page_title="Stock & Index Viewer with Interval-based MAs", layout="wide")
-
-# ------------------------
-# サイドバー（コントロール）
-# ------------------------
-st.sidebar.header("Stock Controls")
-
-# デフォルトの Ticker（株）
-default_tickers = ["VTI", "VXUS", "QYLD", "URTH", "VDE", "VDC", "CPER", "GLD"]
-
-# デフォルトのインデックス Ticker (yfinance 側)
-default_index_tickers = ["^VIX", "EEM/EFA", "^GSPC", "^IXIC", "^DJI", "1592.T", "^N500"]
-
-# デフォルトのインデックス（FRED 系列）
-default_index_fred = ["UNRATE", "T10Y2Y", "MEDCPIM158SFRBCLE", "DFEDTARU"]
-
-# ★ インデックス用 説明テキスト辞書
-#   ここに好きな説明文を足していく想定です
-index_description_map = {
+# ---- インデックス説明テキスト ----
+INDEX_DESCRIPTION_MAP = {
     "1592.T": "TOPIX",
     "^VIX": "VIX Volatility Index",
     "^N500": "Nikkei 500",
@@ -82,130 +33,147 @@ index_description_map = {
     "^IXIC": "Nasdaq",
     "^DJI": "Dow",
     "CPER": "Copper",
-    "^GSPC": "SP500"
+    "^GSPC": "SP500",
     # 必要に応じて追加
 }
 
-
-# グラフの数 n（株価用）
-n_charts = st.sidebar.number_input(
-    "Number of stock tickers (n)",
-    min_value=1,
-    #max_value=6,
-    value=len(default_tickers),        # デフォルト
-    step=1,
-)
-
-# 箱ヒゲ図（ローソク足）の期間（リサンプリング周期）
-freq_map = {
+# ---- ローソク足のリサンプリング周期 ----
+FREQ_MAP = {
     "1h": "1H",
     "1d": "1D",
     "1w": "1W",
     "1m": "1M",
 }
-interval_labels = list(freq_map.keys())
-interval = st.sidebar.radio(
-    "Candle interval (box period)",
-    options=interval_labels,
-    index=1,  # デフォルト: "1d"
-)
 
-# ★ Stocks / Indexes 共通の x軸期間設定（バー風 UI）
-x_range_options = ["3m", "6m", "1y", "3y", "5y", "7y", "10y", "max"]
-x_range_choice = st.sidebar.radio(
-    "X-axis window (for 1d)",
-    options=x_range_options,
-    index=2,          # デフォルト: "1y"
-    horizontal=True,  # バーっぽく横並びに
-)
+# ---- interval → 日数スケール（箱ヒゲの幅用） ----
+INTERVAL_TO_DAYS = {
+    "1h": 1.0 / 24.0,
+    "1d": 1.0,
+    "1w": 7.0,
+    "1m": 30.0,  # おおよその値
+}
 
-# Ticker の入力（株価用）
-tickers = []
-for i in range(n_charts):
-    default_val = default_tickers[i] if i < len(default_tickers) else ""
-    t = st.sidebar.text_input(f"Stock ticker symbol {i+1}", value=default_val)
-    if t.strip():
-        tickers.append(t.strip().upper())
+# ---- interval → MA の単位ラベル（凡例用） ----
+MA_UNIT_LABEL = {
+    "1h": "H",   # hours
+    "1d": "D",   # days
+    "1w": "W",   # weeks
+    "1m": "M",   # months
+}
 
-if not tickers:
-    st.warning("Stock ticker symbol を 1 つ以上入力してください。")
-    st.stop()
+# ---- YTD 棒グラフ用 ----
+YTD_TICKERS = ["EPOL", "VNM", "EWW", "MCHI", "ECH", "EWZ", "EWG", "VXUS", "SPY", "EPI", "EWJ"]
+COUNTRY_MAP_YTD = {
+    "EPOL": "POL",   # Poland
+    "VNM": "VNM",    # Vietnam
+    "EWW": "MEX",    # Mexico
+    "MCHI": "CHN",   # China
+    "ECH": "CHL",    # Chile
+    "EWZ": "BRA",    # Brazil
+    "EWG": "GER",    # Germany
+    "VXUS": "INTL",  # International ex-US
+    "SPY": "USA",    # United States
+    "EPI": "IND",    # India
+    "EWJ": "JPN",    # Japan
+}
+YEAR_START_YTD = "2025-01-01"
 
-# ------------------------
-# インデックス用コントロール
-# ------------------------
-st.sidebar.header("Index Controls")
+# ============================================================
+# 1. FRED 系ヘルパー
+# ============================================================
 
-n_index_extra = st.sidebar.number_input(
-    "Number of additional index tickers",
-    min_value=0,
-    max_value=10,
-    value=0,
-    step=1,
-)
+def get_fred_data(name: str, start: str = "2013-01-01", end: str = "") -> pd.DataFrame:
+    """
+    サンプルコードと同じ形式で FRED の時系列を取得する。
+    index: date, column: 'value'
+    """
+    df = fred.get_series_df(name)[["date", "value"]].copy()
+    df["date"] = pd.to_datetime(df["date"])
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    df = df.set_index("date")
 
-index_extra_tickers = []
-for i in range(n_index_extra):
-    t = st.sidebar.text_input(f"Index ticker {i+1}", value="")
-    if t.strip():
-        index_extra_tickers.append(t.strip().upper())
+    if end == "":
+        return df.loc[f"{start}":]
+    else:
+        return df.loc[f"{start}":f"{end}"]
 
-# ------------------------
-# データ読み込み（株価）
-# ------------------------
+
+@st.cache_data
+def load_fred_ohlcv(series_id: str, start: str = "2013-01-01", end: str = "") -> pd.DataFrame:
+    """
+    FRED の 'value' 時系列を、擬似 OHLCV に変換する。
+    Open = High = Low = Close = value, Volume = 0
+    としてインデックスグラフ用に使う。
+    """
+    df_val = get_fred_data(series_id, start=start, end=end)
+    if df_val is None or df_val.empty or "value" not in df_val.columns:
+        return pd.DataFrame()
+
+    ohlcv = pd.DataFrame(index=df_val.index)
+    ohlcv["Open"] = df_val["value"]
+    ohlcv["High"] = df_val["value"]
+    ohlcv["Low"] = df_val["value"]
+    ohlcv["Close"] = df_val["value"]
+    ohlcv["Volume"] = 0.0
+    return ohlcv
+
+# ============================================================
+# 2. yfinance データ取得ヘルパー
+# ============================================================
+
+def _flatten_stock_df(df_multi: pd.DataFrame) -> pd.DataFrame:
+    """MultiIndex / 単一 Index 両対応で列をフラット化。"""
+    df = df_multi.copy()
+    if isinstance(df.columns, pd.MultiIndex):
+        # ("Close", "AAPL") → "Close"
+        df.columns = [col[0] for col in df.columns]
+    df = df.reset_index().set_index("Date")
+    df.index = pd.to_datetime(df.index)
+    return df
+
+
 @st.cache_data
 def load_stock_df(ticker_symbol: str) -> pd.DataFrame:
-    # yfinance から最大期間を取得
+    """
+    yfinance から最大期間を取得し、OHLCV に整形する。
+    """
     df_raw = yf.download(tickers=ticker_symbol, period="max")
     if df_raw.empty:
         return df_raw
 
-    # MultiIndex / 単一 Index 両対応で flatten
-    def flatten_stock_df(df_multi: pd.DataFrame) -> pd.DataFrame:
-        df = df_multi.copy()
-        if isinstance(df.columns, pd.MultiIndex):
-            # ("Close","AAPL") → "Close"
-            df.columns = [col[0] for col in df.columns]
-        df = df.reset_index().set_index("Date")
-        df.index = pd.to_datetime(df.index)
-        return df
-
-    df_flat = flatten_stock_df(df_raw)
-
-    # 必要な列だけ残す（存在するものだけ）
+    df_flat = _flatten_stock_df(df_raw)
     cols_needed = ["Open", "High", "Low", "Close", "Volume"]
     cols_existing = [c for c in cols_needed if c in df_flat.columns]
-    df_flat = df_flat[cols_existing]
-    return df_flat
+    return df_flat[cols_existing]
+
 
 @st.cache_data
 def load_stock_per(ticker_symbol: str):
+    """
+    PER（Trailing P/E）を取得。
+    """
     ticker = yf.Ticker(ticker_symbol)
     info = ticker.info
-
-    # PER（Trailing P/E）を取得
     pe_ratio = info.get("trailingPE")   # 過去12か月の実績ベース
-    # または前方予想P/Eを取得
-    forward_pe = info.get("forwardPE")
-
-    print('pe_ratio:', pe_ratio)
+    forward_pe = info.get("forwardPE")  # 未使用だが残しておく（将来拡張用）
+    print("pe_ratio:", pe_ratio)
     return pe_ratio
+
 
 @st.cache_data
 def load_stock_eps(ticker_symbol: str):
+    """
+    EPS（Trailing EPS）を取得。
+    """
     ticker = yf.Ticker(ticker_symbol)
     info = ticker.info
-
-    # EPS（Trailing EPS = 過去12か月の実績）
     eps_trailing = info.get("trailingEps")
-
-    # 予想EPS（Forward EPS）
-    eps_forward = info.get("forwardEps")
-
+    eps_forward = info.get("forwardEps")  # 未使用だが残しておく（将来拡張用）
     print(ticker_symbol)
-    print('eps:', eps_trailing)
-    print('for eps:', eps_forward)
+    print("eps:", eps_trailing)
+    print("for eps:", eps_forward)
     return eps_trailing
+
 
 @st.cache_data
 def load_ratio_df_eem_efa() -> pd.DataFrame:
@@ -219,7 +187,6 @@ def load_ratio_df_eem_efa() -> pd.DataFrame:
     if df_eem.empty or df_efa.empty:
         return pd.DataFrame()
 
-    # 両方に共通する日付だけ
     idx = df_eem.index.intersection(df_efa.index)
     if idx.empty:
         return pd.DataFrame()
@@ -232,18 +199,17 @@ def load_ratio_df_eem_efa() -> pd.DataFrame:
         if col in df_eem.columns and col in df_efa.columns:
             ratio_df[col] = df_eem[col] / df_efa[col]
         else:
-            # 必要な列が足りなければ空を返す
-            return pd.DataFrame()
-
-    # Volume はダミー（0）で作成
+            return pd.DataFrame()  # 必要列が足りなければ空
     ratio_df["Volume"] = 0.0
     return ratio_df
 
-# ------------------------
-# OHLCV を任意の頻度にまとめる関数
-# ------------------------
+# ============================================================
+# 3. 計算ヘルパー（リサンプリング・MA・レンジ）
+# ============================================================
+
 def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     """
+    OHLCV を任意の頻度にまとめる。
     rule : '1H', '1D', '1W', '1M' などの resample ルール
     """
     agg = {
@@ -253,18 +219,15 @@ def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
         "Close": "last",
         "Volume": "sum",
     }
-    # Volume がない場合も動くように、共通列だけで agg を組み直す
     agg_used = {k: v for k, v in agg.items() if k in df.columns}
     df_resampled = df.resample(rule).agg(agg_used)
-    # 全て NaN の期間は落とす（OHLC のどれかがあれば OK）
+
     cols_price = [c for c in ["Open", "High", "Low", "Close"] if c in df_resampled.columns]
     if cols_price:
         df_resampled = df_resampled.dropna(subset=cols_price)
     return df_resampled
 
-# ------------------------
-# interval に応じた 10/50/100/200 本分の移動平均
-# ------------------------
+
 def compute_ma_for_interval(df_resampled: pd.DataFrame) -> pd.DataFrame:
     """
     df_resampled : 既に '1H', '1D', '1W', '1M' などでリサンプリングされた DataFrame
@@ -278,37 +241,29 @@ def compute_ma_for_interval(df_resampled: pd.DataFrame) -> pd.DataFrame:
     ma_df["MA200"] = close.rolling(window=200).mean()
     return ma_df
 
-# ------------------------
-# y軸レンジを「min→10%, max→90%」に配置するように計算
-# ------------------------
+
 def compute_axis_range(vmin: float, vmax: float):
+    """
+    y軸レンジを「min→10%, max→90%」に配置するように計算。
+    """
     if pd.isna(vmin) or pd.isna(vmax):
         return None
+
     span = vmax - vmin
     if span <= 0:
-        # すべて同じ値だったときは ±10% の余白
         if vmin == 0:
             return [0, 1]
         return [vmin * 0.9, vmax * 1.1]
 
-    # min が 10%, max が 90% になるように軸レンジを設定
     axis_span = span / 0.8
-    axis_min = vmin - 0.1 * axis_span  # = vmin - span/8
+    axis_min = vmin - 0.1 * axis_span
     axis_max = axis_min + axis_span
     return [axis_min, axis_max]
 
-# Interval → 日数スケール（箱ヒゲの幅）
-interval_to_days = {
-    "1h": 1.0 / 24.0,
-    "1d": 1.0,
-    "1w": 7.0,
-    "1m": 30.0,  # おおよその値
-}
 
-# Base x-axis range を日数換算（株価・インデックス共通）
 def base_range_days(choice: str, full_start: pd.Timestamp, full_end: pd.Timestamp) -> float:
     """
-    x_range_choice で選ばれた期間を「1日あたりの日数」に換算
+    x_range_choice で選ばれた期間を「日数」に換算。
     """
     if choice == "3m":
         return 30.0 * 3.0
@@ -325,94 +280,123 @@ def base_range_days(choice: str, full_start: pd.Timestamp, full_end: pd.Timestam
     elif choice == "10y":
         return 365.0 * 10.0
     elif choice == "max":
-        # 利用可能な全期間
         return max(1.0, (full_end - full_start).days)
     else:
-        # デフォルトは 1年
-        return 365.0
+        return 365.0  # デフォルト 1年
 
-# interval → MA の単位ラベル（凡例用）
-ma_unit_label = {
-    "1h": "H",   # hours
-    "1d": "D",   # days
-    "1w": "W",   # weeks
-    "1m": "M",   # months
-}
+# ============================================================
+# 4. Plotly 図生成関数
+# ============================================================
 
-# ------------------------
-# グラフ生成関数（株価・インデックス共通）
-# ------------------------
-def build_figure(
-    df_input: pd.DataFrame,
-    label: str,
-    per,
-    eps,
+def _calc_view_window(
+    df_freq: pd.DataFrame,
+    interval: str,
     base_range_choice: str,
-    show_volume: bool = True,
-    show_per_in_title: bool = True,
-    index_desc: str = "",        # ★ インデックス用説明テキスト
-):
-    # 選択された interval でリサンプリング
-    rule = freq_map[interval]
-    df_freq = resample_ohlcv(df_input, rule)
-    if df_freq.empty:
-        st.error(f"{label}: {interval} でリサンプリングできるデータがありません。")
-        return None
-
+) -> tuple[pd.Timestamp, pd.Timestamp, pd.DataFrame]:
+    """
+    interval と base_range_choice に応じて、表示期間を計算。
+    戻り値: (start, full_end, df_view)
+    """
     full_start = df_freq.index.min()
     full_end = df_freq.index.max()
 
-    # 1d のときのベース期間（日数）を求める
     base_days = base_range_days(base_range_choice, full_start, full_end)
 
-    # 箱ヒゲの期間に応じて、x軸の期間をスケーリング
-    factor = interval_to_days.get(interval, 1.0) / interval_to_days["1d"]
+    factor = INTERVAL_TO_DAYS.get(interval, 1.0) / INTERVAL_TO_DAYS["1d"]
     span_days = base_days * factor
 
-    # 実際の表示期間
     start_candidate = full_end - pd.Timedelta(days=span_days)
     start = max(full_start, start_candidate)
 
-    # 表示範囲（y軸レンジ計算用）
     df_view = df_freq.loc[(df_freq.index >= start) & (df_freq.index <= full_end)]
     if df_view.empty:
         df_view = df_freq.copy()
         start = df_view.index.min()
 
-    # プロット用データ（全期間）
+    return start, full_end, df_view
+
+
+def _make_title(
+    label: str,
+    per,
+    eps,
+    show_per_in_title: bool,
+    index_desc: str = "",
+) -> str:
+    """
+    株価・インデックス共通のタイトル文字列を生成。
+    """
+    if show_per_in_title:
+        if per is not None and eps is not None:
+            return f"{label} PER:{per:.1f} EPS:{eps:.1f}"
+        elif per is not None and eps is None:
+            return f"{label} PER:{per:.1f}"
+        else:
+            return f"{label} PER:NA"
+    else:
+        if index_desc:
+            return f"{label}:{index_desc}"
+        return label
+
+
+def build_figure(
+    df_input: pd.DataFrame,
+    label: str,
+    per,
+    eps,
+    interval: str,
+    base_range_choice: str,
+    show_volume: bool = True,
+    show_per_in_title: bool = True,
+    index_desc: str = "",
+):
+    """
+    株価・インデックス共通のグラフ生成関数。
+    interval でリサンプリングし、OHLC や MA、Volume を描画する。
+    """
+    if interval not in FREQ_MAP:
+        st.error(f"Unknown interval: {interval}")
+        return None
+
+    # ---- リサンプリング ----
+    rule = FREQ_MAP[interval]
+    df_freq = resample_ohlcv(df_input, rule)
+    if df_freq.empty:
+        st.error(f"{label}: {interval} でリサンプリングできるデータがありません。")
+        return None
+
+    start, full_end, df_view = _calc_view_window(df_freq, interval, base_range_choice)
     df_plot = df_freq
 
-    # y軸レンジ計算（Price）
+    # ---- y軸レンジ（Price / Volume） ----
     price_cols = [c for c in ["Open", "High", "Low", "Close"] if c in df_view.columns]
     price_min = df_view[price_cols].min().min()
     price_max = df_view[price_cols].max().max()
     price_range = compute_axis_range(price_min, price_max)
 
-    # y軸レンジ計算（Volume）
     vol_range = None
     if show_volume and "Volume" in df_view.columns:
         vol_min = df_view["Volume"].min()
         vol_max = df_view["Volume"].max()
         vol_range = compute_axis_range(vol_min, vol_max)
 
-    # interval に対応した 10/50/100/200 本分の移動平均を計算（全期間）
+    # ---- MA 計算 ----
     ma_all = compute_ma_for_interval(df_freq)
     ma_for_plot = ma_all
 
-    # 上昇/下落フラグ（Close >= Open → 上昇）全期間
+    # ---- 上昇/下落フラグ ----
     up_all = df_plot["Close"] >= df_plot["Open"]
     volume_colors_all = ["green" if is_up else "red" for is_up in up_all]
 
-    # MA の凡例ラベル（単位を interval に合わせる）
-    unit = ma_unit_label.get(interval, "")
+    # ---- MA 凡例ラベル ----
+    unit = MA_UNIT_LABEL.get(interval, "")
     label_10 = f"MA 10{unit}" if unit else "MA 10"
     label_50 = f"MA 50{unit}" if unit else "MA 50"
     label_100 = f"MA 100{unit}" if unit else "MA 100"
     label_200 = f"MA 200{unit}" if unit else "MA 200"
 
-    # Plotly 図の作成
+    # ---- Figure 準備 ----
     if show_volume:
-        # 株価用：上段 Price、下段 Volume
         fig = make_subplots(
             rows=2,
             cols=1,
@@ -423,7 +407,6 @@ def build_figure(
         row_price = 1
         row_volume = 2
     else:
-        # インデックス用：Price のみ
         fig = make_subplots(
             rows=1,
             cols=1,
@@ -434,11 +417,9 @@ def build_figure(
         row_price = 1
         row_volume = None
 
-    # ---------------------------
-    # 価格のプロット
-    # ---------------------------
+    # ---- 価格のプロット ----
     if show_volume:
-        # 株価用：ローソク足（箱ヒゲ）
+        # 株価用：ローソク足
         candle = go.Candlestick(
             x=df_plot.index,
             open=df_plot["Open"],
@@ -454,7 +435,7 @@ def build_figure(
         )
         fig.add_trace(candle, row=row_price, col=1)
     else:
-        # インデックス用：Close の折れ線（#346FF4）
+        # インデックス用：Close の折れ線
         price_line = go.Scatter(
             x=df_plot.index,
             y=df_plot["Close"],
@@ -464,9 +445,7 @@ def build_figure(
         )
         fig.add_trace(price_line, row=row_price, col=1)
 
-    # ---------------------------
-    # 出来高（株価のみ）
-    # ---------------------------
+    # ---- 出来高（株価のみ） ----
     if show_volume and "Volume" in df_plot.columns and row_volume is not None:
         volume = go.Bar(
             x=df_plot.index,
@@ -477,11 +456,9 @@ def build_figure(
         )
         fig.add_trace(volume, row=row_volume, col=1)
 
-    # ---------------------------
-    # 移動平均線
-    # ---------------------------
+    # ---- 移動平均線 ----
     if show_volume:
-        # 株価用：10/50/100 本分移動平均線（全期間）
+        # 株価用：10/50/100 本分
         fig.add_trace(
             go.Scatter(
                 x=ma_for_plot.index,
@@ -493,7 +470,6 @@ def build_figure(
             row=row_price,
             col=1,
         )
-
         fig.add_trace(
             go.Scatter(
                 x=ma_for_plot.index,
@@ -505,7 +481,6 @@ def build_figure(
             row=row_price,
             col=1,
         )
-
         fig.add_trace(
             go.Scatter(
                 x=ma_for_plot.index,
@@ -518,7 +493,7 @@ def build_figure(
             col=1,
         )
     else:
-        # インデックス用：200 本分移動平均線のみ（黒線）
+        # インデックス用：200 本分
         fig.add_trace(
             go.Scatter(
                 x=ma_for_plot.index,
@@ -531,24 +506,8 @@ def build_figure(
             col=1,
         )
 
-    # ---------------------------
-    # タイトル文字列
-    # ---------------------------
-    if show_per_in_title:
-        # 株価用
-        if per is not None and eps is not None:
-            title_text = f"{label} PER:{per:.1f} EPS:{eps:.1f}"
-        elif per is not None and eps is None:
-            title_text = f"{label} PER:{per:.1f}"
-        else:
-            title_text = f"{label} PER:NA"
-    else:
-        # インデックス用：シンボル + 説明（あれば）
-        if index_desc:
-            title_text = f"{label}:{index_desc}"
-        else:
-            title_text = label
-
+    # ---- タイトル ----
+    title_text = _make_title(label, per, eps, show_per_in_title, index_desc=index_desc)
     fig.add_annotation(
         x=0.5,
         y=1.0,
@@ -559,27 +518,21 @@ def build_figure(
         font=dict(size=16),
     )
 
-    # レイアウト設定
+    # ---- レイアウト共通設定 ----
+    layout_common = dict(
+        dragmode="pan",
+        showlegend=True,
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        margin=dict(l=0, r=0, t=0, b=0),
+    )
     if show_volume:
-        fig.update_layout(
-            dragmode="pan",
-            showlegend=True,
-            plot_bgcolor="white",
-            paper_bgcolor="white",
-            margin=dict(l=0, r=0, t=0, b=0),
-            height=250,
-        )
+        layout_common["height"] = 250
     else:
-        fig.update_layout(
-            dragmode="pan",
-            showlegend=True,
-            plot_bgcolor="white",
-            paper_bgcolor="white",
-            margin=dict(l=0, r=0, t=0, b=0),
-            height=200,
-        )
+        layout_common["height"] = 200
+    fig.update_layout(**layout_common)
 
-    # x軸レンジ（初期表示だけ制限、データ自体は全期間）
+    # ---- x軸レンジ（初期表示） ----
     fig.update_xaxes(
         range=[start, full_end],
         rangeslider_visible=False,
@@ -594,186 +547,152 @@ def build_figure(
             col=1,
         )
 
-    # y軸レンジ（Price / Volume）
+    # ---- y軸レンジ ----
     if price_range is not None:
         fig.update_yaxes(range=price_range, row=row_price, col=1)
-    if show_volume and vol_range is not None and row_volume is not None:
+    if show_volume and row_volume is not None and vol_range is not None:
         fig.update_yaxes(range=vol_range, row=row_volume, col=1)
 
     return fig
 
-# ------------------------
-# 上側：株価グリッド表示
-# ------------------------
-st.markdown("## Stocks")
+# ============================================================
+# 5. UI 用コンポーネント関数（図を返すだけにする）
+# ============================================================
 
-n_cols = 4
-chart_idx = 0
-cols = None
+def get_stock_figures(
+    tickers: list[str],
+    interval: str,
+    x_range_choice: str,
+):
+    """株価セクションで表示する Figure のリストを返す。"""
+    figs = []
 
-for ticker in tickers:
-    stock_df = load_stock_df(ticker)
-    per = load_stock_per(ticker)
-    eps = load_stock_eps(ticker)
+    for ticker in tickers:
+        stock_df = load_stock_df(ticker)
+        per = load_stock_per(ticker)
+        eps = load_stock_eps(ticker)
 
-    if stock_df.empty:
-        st.error(f"{ticker}: データが取得できませんでした。Ticker シンボルを確認してください。")
-        continue
-
-    fig = build_figure(
-        stock_df,
-        ticker,
-        per,
-        eps,
-        base_range_choice=x_range_choice,  # ★共通期間設定を使用
-        show_volume=True,
-        show_per_in_title=True,   # 株価：PER をタイトルに表示
-    )
-    if fig is None:
-        continue
-
-    if chart_idx % n_cols == 0:
-        cols = st.columns(n_cols)
-
-    col = cols[chart_idx % n_cols]
-    with col:
-        st.plotly_chart(fig, use_container_width=True)
-
-    chart_idx += 1
-
-# ------------------------
-# 下側：インデックスグラフ（値のみ）
-# ------------------------
-st.markdown("## Indexes")
-
-# デフォルトインデックス + 追加インデックス (yfinance 側)
-index_tickers = default_index_tickers + index_extra_tickers
-
-n_cols_idx = n_cols
-idx_chart = 0
-cols_idx = None
-
-# まず yfinance のインデックス
-for idx_ticker in index_tickers:
-    # EEM/EFA は疑似インデックス（比率）
-    if idx_ticker == "EEM/EFA":
-        df_idx = load_ratio_df_eem_efa()
-        if df_idx.empty:
-            st.warning("EEM/EFA のインデックスデータが取得できませんでした。")
-            continue
-    else:
-        df_idx = load_stock_df(idx_ticker)
-        if df_idx.empty:
-            st.error(f"{idx_ticker}: インデックスデータが取得できませんでした。Ticker シンボルを確認してください。")
+        if stock_df.empty:
+            st.error(f"{ticker}: データが取得できませんでした。Ticker シンボルを確認してください。")
             continue
 
-    # ★ 説明文を辞書から取得
-    idx_desc = index_description_map.get(idx_ticker, "")
+        fig = build_figure(
+            stock_df,
+            label=ticker,
+            per=per,
+            eps=eps,
+            interval=interval,
+            base_range_choice=x_range_choice,
+            show_volume=True,
+            show_per_in_title=True,
+        )
+        if fig is not None:
+            figs.append(fig)
 
-    fig_idx = build_figure(
-        df_idx,
-        idx_ticker,
-        per=None,
-        eps=None,
-        base_range_choice=x_range_choice,  # ★Stocks と同じ期間設定を使用
-        show_volume=False,          # インデックス：出来高を表示しない（＝line表示）
-        show_per_in_title=False,    # インデックス：PERは表示しない
-        index_desc=idx_desc,        # ★ 説明テキスト
-    )
-    if fig_idx is None:
-        continue
+    return figs
 
-    if idx_chart % n_cols_idx == 0:
-        cols_idx = st.columns(n_cols_idx)
 
-    col_idx = cols_idx[idx_chart % n_cols_idx]
-    with col_idx:
-        st.plotly_chart(fig_idx, use_container_width=True)
+def get_index_figures(
+    interval: str,
+    x_range_choice: str,
+    default_index_tickers: list[str],
+    extra_index_tickers: list[str],
+    fred_series_list: list[str],
+):
+    """インデックスセクションで表示する Figure のリストを返す。"""
+    figs = []
 
-    idx_chart += 1
+    # ---- yfinance インデックス ----
+    index_tickers = default_index_tickers + extra_index_tickers
 
-# 次に FRED 系列のインデックスを追加
-for fred_series in default_index_fred:
-    df_fred = load_fred_ohlcv(fred_series)
-    if df_fred.empty:
-        st.warning(f"{fred_series}: FRED データが取得できませんでした。FRED シリーズIDや API キーを確認してください。")
-        continue
+    for idx_ticker in index_tickers:
+        if idx_ticker == "EEM/EFA":
+            df_idx = load_ratio_df_eem_efa()
+            if df_idx.empty:
+                st.warning("EEM/EFA のインデックスデータが取得できませんでした。")
+                continue
+        else:
+            df_idx = load_stock_df(idx_ticker)
+            if df_idx.empty:
+                st.error(f"{idx_ticker}: インデックスデータが取得できませんでした。Ticker シンボルを確認してください。")
+                continue
 
-    # ★ FRED シリーズ用の説明文
-    fred_desc = index_description_map.get(fred_series, "")
+        idx_desc = INDEX_DESCRIPTION_MAP.get(idx_ticker, "")
 
-    fig_fred = build_figure(
-        df_fred,
-        fred_series,
-        per=None,
-        eps=None,
-        base_range_choice=x_range_choice,  # ★共通期間設定
-        show_volume=False,          # インデックス：出来高なし
-        show_per_in_title=False,    # タイトルは PER なし
-        index_desc=fred_desc,       # ★ 説明テキスト
-    )
-    if fig_fred is None:
-        continue
+        fig_idx = build_figure(
+            df_idx,
+            label=idx_ticker,
+            per=None,
+            eps=None,
+            interval=interval,
+            base_range_choice=x_range_choice,
+            show_volume=False,
+            show_per_in_title=False,
+            index_desc=idx_desc,
+        )
+        if fig_idx is not None:
+            figs.append(fig_idx)
 
-    if idx_chart % n_cols_idx == 0:
-        cols_idx = st.columns(n_cols_idx)
+    # ---- FRED 系列インデックス ----
+    for fred_series in fred_series_list:
+        df_fred = load_fred_ohlcv(fred_series)
+        if df_fred.empty:
+            st.warning(f"{fred_series}: FRED データが取得できませんでした。FRED シリーズIDや API キーを確認してください。")
+            continue
 
-    col_idx = cols_idx[idx_chart % n_cols_idx]
-    with col_idx:
-        st.plotly_chart(fig_fred, use_container_width=True)
+        fred_desc = INDEX_DESCRIPTION_MAP.get(fred_series, "")
 
-    idx_chart += 1
+        fig_fred = build_figure(
+            df_fred,
+            label=fred_series,
+            per=None,
+            eps=None,
+            interval=interval,
+            base_range_choice=x_range_choice,
+            show_volume=False,
+            show_per_in_title=False,
+            index_desc=fred_desc,
+        )
+        if fig_fred is not None:
+            figs.append(fig_fred)
 
-# ------------------------
-# 「その他」：YTD 棒グラフ（サンプルコードのグラフ）
-# ------------------------
-st.markdown("## その他")
+    return figs
 
-# 対象ETF ＆ 国名略称マップ（サンプルコードと同じ）
-ytd_tickers = ["EPOL", "VNM", "EWW", "MCHI", "ECH", "EWZ", "EWG", "VXUS", "SPY", "EPI", "EWJ"]
 
-country_map_ytd = {
-    "EPOL": "POL",   # Poland
-    "VNM": "VNM",    # Vietnam
-    "EWW": "MEX",    # Mexico
-    "MCHI": "CHN",   # China
-    "ECH": "CHL",    # Chile
-    "EWZ": "BRA",    # Brazil
-    "EWG": "GER",    # Germany
-    "VXUS": "INTL",  # International ex-US
-    "SPY": "USA",    # United States
-    "EPI": "IND",    # India
-    "EWJ": "JPN",    # Japan
-}
+def build_ytd_figure():
+    """
+    YTD パフォーマンスの棒グラフ Figure を返す。
+    ストリームリットのレイアウト(st.columns, with ...) は main() 側で行う。
+    """
+    ytd_results = []
+    for ticker in YTD_TICKERS:
+        data = yf.download(ticker, start=YEAR_START_YTD)
+        if len(data) < 2:
+            st.warning(f"{ticker} のYTD計算に必要なデータが不足しています")
+            continue
 
-year_start_ytd = "2025-01-01"
-ytd_results = []
+        open_price = data.iloc[0]["Open"]
+        current_price = data.iloc[-1]["Close"]
+        ytd_val = float((current_price / open_price - 1) * 100)
 
-for ticker in ytd_tickers:
-    data = yf.download(ticker, start=year_start_ytd)
+        ytd_results.append(
+            {
+                "Ticker": ticker,
+                "YTD": ytd_val,
+                "Country": COUNTRY_MAP_YTD[ticker],
+            }
+        )
 
-    if len(data) < 2:
-        st.warning(f"{ticker} のYTD計算に必要なデータが不足しています")
-        continue
+    if not ytd_results:
+        st.info("その他のYTDパフォーマンスを計算できるデータがありませんでした。")
+        return None
 
-    open_price = data.iloc[0]["Open"]
-    current_price = data.iloc[-1]["Close"]
-    ytd_val = float((current_price / open_price - 1) * 100)
+    df_ytd = pd.DataFrame(ytd_results).sort_values("YTD", ascending=False)
 
-    ytd_results.append({
-        "Ticker": ticker,
-        "YTD": ytd_val,
-        "Country": country_map_ytd[ticker],
-    })
-
-if ytd_results:
-    df_ytd = pd.DataFrame(ytd_results)
-    df_ytd = df_ytd.sort_values("YTD", ascending=False)
-
-    # x軸ラベル（2段構成：Ticker + 国名略称）
+    # x軸ラベル（Ticker + 国名略称）
     x_labels_ytd = [f"{t}<br>{c}" for t, c in zip(df_ytd["Ticker"], df_ytd["Country"])]
 
-    # 色付け（SPYだけ赤）
+    # SPY だけ赤
     colors_ytd = ["red" if t == "SPY" else "#1f567d" for t in df_ytd["Ticker"]]
 
     fig_ytd = go.Figure(
@@ -797,9 +716,260 @@ if ytd_results:
         height=400,
     )
 
-    # ここも 3 列レイアウトにして、その 1 列目に棒グラフを表示
-    misc_cols = st.columns(3)
-    with misc_cols[0]:
-        st.plotly_chart(fig_ytd, use_container_width=True)
-else:
-    st.info("その他のYTDパフォーマンスを計算できるデータがありませんでした。")
+    return fig_ytd
+
+
+def build_ytd_year_figure() -> go.Figure | None:
+    # -----------------------------
+    # 2. 対象となる過去10年間（フルイヤー）＋ 今年(YTD)
+    #    例：今が2025年なら 2015〜2024年がフルイヤー,
+    #        2025年は年初〜今日までのYTD
+    # -----------------------------
+    today = dt.date.today()
+    current_year = today.year
+
+    start_year = current_year - 10        # 10年前の年（フルイヤーの最初）
+    end_year = current_year - 1           # 直近のフルイヤーの最後
+    years_full = list(range(start_year, end_year + 1))
+
+    records = []
+
+    # -----------------------------
+    # 3-1. フルイヤーの年次リターン計算（〜昨年まで）
+    # -----------------------------
+    for ticker in YTD_TICKERS:
+        for year in years_full:
+            year_start = f"{year}-01-01"
+            year_end   = f"{year + 1}-01-01"  # 翌年の1/1まで取得して、その直前が年末
+
+            data = yf.download(ticker, start=year_start, end=year_end, progress=False)
+
+            # データ不足の場合はスキップ
+            if len(data) < 2:
+                print(f"{ticker} の {year} 年のデータが不足しています")
+                continue
+
+            open_price = data.iloc[0]["Open"]     # 年初の営業日の始値
+            close_price = data.iloc[-1]["Close"]  # 年末の営業日の終値
+            annual_return = float((close_price / open_price - 1) * 100)
+
+            records.append({
+                "Year": year,
+                "Ticker": ticker,
+                "Country": COUNTRY_MAP_YTD[ticker],
+                "Return(%)": annual_return
+            })
+
+    # -----------------------------
+    # 3-2. 今年のYTDリターン計算
+    #      年初(1/1以降の最初の営業日)〜「現在まで」の成長率
+    # -----------------------------
+    ytd_start = dt.date(current_year, 1, 1).isoformat()
+    # yfinance の end は「その前日」まで取得なので、今日の翌日を指定
+    ytd_end = (today + dt.timedelta(days=1)).isoformat()
+
+    for ticker in YTD_TICKERS:
+        data = yf.download(ticker, start=ytd_start, end=ytd_end, progress=False)
+
+        if len(data) < 2:
+            print(f"{ticker} の {current_year} 年(YTD)のデータが不足しています")
+            continue
+
+        open_price = data.iloc[0]["Open"]     # 今年最初の営業日の始値
+        close_price = data.iloc[-1]["Close"]  # 現在時点での直近営業日の終値
+        ytd_return = float((close_price / open_price - 1) * 100)
+
+        records.append({
+            "Year": current_year,
+            "Ticker": ticker,
+            "Country": COUNTRY_MAP_YTD[ticker],
+            "Return(%)": ytd_return
+        })
+
+    # -----------------------------
+    # 4. 長い形式の DataFrame & 国ごとのピボット
+    # -----------------------------
+    df_long = pd.DataFrame(records)
+
+    # 国ごとの成長率テーブル（行：Year, 列：Country）
+    df_country = df_long.pivot_table(
+        index="Year",
+        columns="Country",
+        values="Return(%)"
+    ).sort_index()
+
+    print("=== 国ごとの年次リターン DataFrame ===")
+    print(df_country)
+
+    # -----------------------------
+    # 5. Plotly ドット＋線グラフ作成
+    #    （各国ごとに lines+markers で比較）
+    # -----------------------------
+    fig = go.Figure()
+
+    # 国ごとに線を引く
+    for country in sorted(df_long["Country"].unique()):
+        country_data = df_long[df_long["Country"] == country].sort_values("Year")
+
+        # SPY(USA)だけ色を変えたい場合
+        if country == "USA":
+            line_color = "red"
+        else:
+            line_color = None  # Plotly におまかせ
+
+        fig.add_trace(
+            go.Scatter(
+                x=country_data["Year"],
+                y=country_data["Return(%)"],
+                mode="lines+markers",          # ドット＋線
+                name=country,
+                line=dict(color=line_color) if line_color else None
+            )
+        )
+
+    fig.update_layout(
+        title=f"Annual Returns by Country ({start_year}–{current_year}) ",
+        xaxis_title="Year",
+        yaxis_title="Return (%)",
+        template="plotly_white",
+        hovermode="x unified",
+        legend_title="Country",
+        margin=dict(l=40, r=40, t=80, b=40),
+    )
+
+    return fig
+
+
+
+# ============================================================
+# 6. メインアプリ（Streamlit の構成はここに集約）
+# ============================================================
+
+def main():
+    # ------------------------
+    # Streamlit ページ設定
+    # ------------------------
+    st.set_page_config(
+        page_title="StockDash",
+        layout="wide",
+    )
+
+    st.sidebar.title("📈StockDash")
+
+    # ------------------------
+    # サイドバー（株コントロール）
+    # ------------------------
+    st.sidebar.header("Stock Controls")
+
+    # グラフの数 n（株価用）
+    n_charts = st.sidebar.number_input(
+        "Number of stock tickers (n)",
+        min_value=1,
+        value=len(DEFAULT_STOCK_TICKERS),
+        step=1,
+    )
+
+    # interval 選択
+    interval_labels = list(FREQ_MAP.keys())
+    interval = st.sidebar.radio(
+        "Candle interval (box period)",
+        options=interval_labels,
+        index=1,  # デフォルト: "1d"
+    )
+
+    # x軸期間選択
+    x_range_options = ["3m", "6m", "1y", "3y", "5y", "7y", "10y", "max"]
+    x_range_choice = st.sidebar.radio(
+        "X-axis window (for 1d)",
+        options=x_range_options,
+        index=2,  # デフォルト: "1y"
+        horizontal=True,
+    )
+
+    # Ticker 入力
+    tickers: list[str] = []
+    for i in range(n_charts):
+        default_val = DEFAULT_STOCK_TICKERS[i] if i < len(DEFAULT_STOCK_TICKERS) else ""
+        t = st.sidebar.text_input(f"Stock ticker symbol {i+1}", value=default_val)
+        if t.strip():
+            tickers.append(t.strip().upper())
+
+    if not tickers:
+        st.warning("Stock ticker symbol を 1 つ以上入力してください。")
+        st.stop()
+
+    # ------------------------
+    # サイドバー（インデックスコントロール）
+    # ------------------------
+    st.sidebar.header("Index Controls")
+
+    n_index_extra = st.sidebar.number_input(
+        "Number of additional index tickers",
+        min_value=0,
+        max_value=10,
+        value=0,
+        step=1,
+    )
+
+    index_extra_tickers: list[str] = []
+    for i in range(n_index_extra):
+        t = st.sidebar.text_input(f"Index ticker {i+1}", value="")
+        if t.strip():
+            index_extra_tickers.append(t.strip().upper())
+
+    # ------------------------
+    # メインレイアウト構成（st.columns / with は全てここ）
+    # ------------------------
+    n_cols = 4
+
+    # ===== Stocks セクション =====
+    st.markdown("## Stocks")
+    stock_figs = get_stock_figures(
+        tickers=tickers,
+        interval=interval,
+        x_range_choice=x_range_choice,
+    )
+
+    if stock_figs:
+        for idx, fig in enumerate(stock_figs):
+            if idx % n_cols == 0:
+                cols = st.columns(n_cols)
+            col = cols[idx % n_cols]
+            with col:
+                st.plotly_chart(fig, use_container_width=True)
+
+    # ===== Indexes セクション =====
+    st.markdown("## Indexes")
+    index_figs = get_index_figures(
+        interval=interval,
+        x_range_choice=x_range_choice,
+        default_index_tickers=DEFAULT_INDEX_TICKERS_YF,
+        extra_index_tickers=index_extra_tickers,
+        fred_series_list=DEFAULT_INDEX_TICKERS_FRED,
+    )
+
+    if index_figs:
+        for idx, fig in enumerate(index_figs):
+            if idx % n_cols == 0:
+                cols = st.columns(n_cols)
+            col = cols[idx % n_cols]
+            with col:
+                st.plotly_chart(fig, use_container_width=True)
+
+    # ===== その他（YTD）セクション =====
+    st.markdown("## Others")
+    fig_ytd = build_ytd_figure()
+    fig_ytd_year = build_ytd_year_figure()
+    if fig_ytd is not None:
+        # misc_cols = st.columns(3)
+        # with misc_cols[0]:
+        #     st.plotly_chart(fig_ytd, use_container_width=True)
+        col_left, col_right = st.columns([1, 2])
+        with col_left:
+            st.plotly_chart(fig_ytd, use_container_width=True)
+        with col_right:
+            st.plotly_chart(fig_ytd_year, use_container_width=True)
+
+
+if __name__ == "__main__":
+    main()
