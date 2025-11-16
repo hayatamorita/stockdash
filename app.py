@@ -18,13 +18,13 @@ fred = Fred()  # FRED_API_KEY を環境変数から読む
 
 # ---- デフォルト Ticker 設定 ----
 DEFAULT_STOCK_TICKERS = ["VTI", "VXUS", "QYLD", "URTH", "VDE", "VDC", "CPER", "GLD"]
-DEFAULT_INDEX_TICKERS_YF = ["^VIX", "EEM/EFA", "^GSPC", "^IXIC", "^DJI", "1592.T", "^N500"]
-DEFAULT_INDEX_TICKERS_FRED = ["UNRATE", "T10Y2Y", "MEDCPIM158SFRBCLE", "DFEDTARU"]
+DEFAULT_INDEX_TICKERS_YF = ["^VIX", "EEM/EFA", "^IXIC", "^DJI", "1592.T", "^N500"]
+DEFAULT_INDEX_TICKERS_FRED = ["SP500", "DEXJPUS", "DGS10", "FEDFUNDS", "UNRATE", "MEDCPIM158SFRBCLE", "GDPC1", "T10Y2Y", "DFEDTARU"]
 
 # ---- インデックス説明テキスト ----
 INDEX_DESCRIPTION_MAP = {
     "1592.T": "TOPIX",
-    "^VIX": "VIX Volatility Index",
+    "^VIX": "VIX",
     "^N500": "Nikkei 500",
     "UNRATE": "Unemployment Rate",
     "T10Y2Y": "10Y-2Y Treasury",
@@ -34,7 +34,12 @@ INDEX_DESCRIPTION_MAP = {
     "^DJI": "Dow",
     "CPER": "Copper",
     "^GSPC": "SP500",
-    # 必要に応じて追加
+    "DEXJPUS": "USD/JPY",
+    "FEDFUNDS": "Federal Funds Rate",
+    "SP500": "SP500",
+    "DGS10": "10-year Treasury yield",
+    "GDPC1": "GDP YOY",
+    "EEM/EFA": "EEM/EFA",
 }
 
 # ---- ローソク足のリサンプリング周期 ----
@@ -117,6 +122,41 @@ def load_fred_ohlcv(series_id: str, start: str = "2013-01-01", end: str = "") ->
     ohlcv["Volume"] = 0.0
     return ohlcv
 
+def calc_gdp_yoy_df(df):
+    """
+    GDPC1のOHLC DataFrameを入力し、
+    前年同期比 YoY (%) を元dfと同じ列構造で返す。
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        columns: ['Open', 'High', 'Low', 'Close', 'Volume']
+
+    Returns
+    -------
+    df_yoy : pd.DataFrame
+        同じ列構造で YoY をセットした DataFrame
+    """
+    # GDP値は Close から取る
+    gdp = df['Close']
+
+    # YoY 計算
+    gdp_yoy = (gdp / gdp.shift(4) - 1) * 100
+
+    # 元の列構造を引き継ぐ
+    df_yoy = pd.DataFrame(index=df.index, columns=df.columns, dtype=float)
+
+    # OHLC に同じ値を入れる
+    df_yoy['Open']  = gdp_yoy
+    df_yoy['High']  = gdp_yoy
+    df_yoy['Low']   = gdp_yoy
+    df_yoy['Close'] = gdp_yoy
+    
+    # Volume は 0 にする or NaN にしたければ df_yoy['Volume'] = np.nan
+    df_yoy['Volume'] = 0.0
+
+    return df_yoy
+
 # ============================================================
 # 2. yfinance データ取得ヘルパー
 # ============================================================
@@ -137,7 +177,7 @@ def load_stock_df(ticker_symbol: str) -> pd.DataFrame:
     """
     yfinance から最大期間を取得し、OHLCV に整形する。
     """
-    df_raw = yf.download(tickers=ticker_symbol, period="max")
+    df_raw = yf.download(tickers=ticker_symbol, period="max", auto_adjust=False)
     if df_raw.empty:
         return df_raw
 
@@ -335,7 +375,8 @@ def _make_title(
             return f"{label} PER:NA"
     else:
         if index_desc:
-            return f"{label}:{index_desc}"
+            #return f"{label}:{index_desc}"
+            return f"{index_desc}"
         return label
 
 
@@ -601,6 +642,30 @@ def get_index_figures(
 ):
     """インデックスセクションで表示する Figure のリストを返す。"""
     figs = []
+    # ---- FRED 系列インデックス ----
+    for fred_series in fred_series_list:
+        df_fred = load_fred_ohlcv(fred_series)
+        if fred_series == 'GDPC1':
+            df_fred = calc_gdp_yoy_df(df_fred)
+        if df_fred.empty:
+            st.warning(f"{fred_series}: FRED データが取得できませんでした。FRED シリーズIDや API キーを確認してください。")
+            continue
+
+        fred_desc = INDEX_DESCRIPTION_MAP.get(fred_series, "")
+
+        fig_fred = build_figure(
+            df_fred,
+            label=fred_series,
+            per=None,
+            eps=None,
+            interval=interval,
+            base_range_choice=x_range_choice,
+            show_volume=False,
+            show_per_in_title=False,
+            index_desc=fred_desc,
+        )
+        if fig_fred is not None:
+            figs.append(fig_fred)
 
     # ---- yfinance インデックス ----
     index_tickers = default_index_tickers + extra_index_tickers
@@ -633,28 +698,6 @@ def get_index_figures(
         if fig_idx is not None:
             figs.append(fig_idx)
 
-    # ---- FRED 系列インデックス ----
-    for fred_series in fred_series_list:
-        df_fred = load_fred_ohlcv(fred_series)
-        if df_fred.empty:
-            st.warning(f"{fred_series}: FRED データが取得できませんでした。FRED シリーズIDや API キーを確認してください。")
-            continue
-
-        fred_desc = INDEX_DESCRIPTION_MAP.get(fred_series, "")
-
-        fig_fred = build_figure(
-            df_fred,
-            label=fred_series,
-            per=None,
-            eps=None,
-            interval=interval,
-            base_range_choice=x_range_choice,
-            show_volume=False,
-            show_per_in_title=False,
-            index_desc=fred_desc,
-        )
-        if fig_fred is not None:
-            figs.append(fig_fred)
 
     return figs
 
@@ -666,14 +709,14 @@ def build_ytd_figure():
     """
     ytd_results = []
     for ticker in YTD_TICKERS:
-        data = yf.download(ticker, start=YEAR_START_YTD)
+        data = yf.download(ticker, start=YEAR_START_YTD, auto_adjust=False)
         if len(data) < 2:
             st.warning(f"{ticker} のYTD計算に必要なデータが不足しています")
             continue
 
         open_price = data.iloc[0]["Open"]
         current_price = data.iloc[-1]["Close"]
-        ytd_val = float((current_price / open_price - 1) * 100)
+        ytd_val = float(((current_price / open_price - 1) * 100).iloc[0])
 
         ytd_results.append(
             {
@@ -742,7 +785,7 @@ def build_ytd_year_figure() -> go.Figure | None:
             year_start = f"{year}-01-01"
             year_end   = f"{year + 1}-01-01"  # 翌年の1/1まで取得して、その直前が年末
 
-            data = yf.download(ticker, start=year_start, end=year_end, progress=False)
+            data = yf.download(ticker, start=year_start, end=year_end, progress=False, auto_adjust=False)
 
             # データ不足の場合はスキップ
             if len(data) < 2:
@@ -751,7 +794,7 @@ def build_ytd_year_figure() -> go.Figure | None:
 
             open_price = data.iloc[0]["Open"]     # 年初の営業日の始値
             close_price = data.iloc[-1]["Close"]  # 年末の営業日の終値
-            annual_return = float((close_price / open_price - 1) * 100)
+            annual_return = float(((close_price / open_price - 1) * 100).iloc[0])
 
             records.append({
                 "Year": year,
@@ -769,7 +812,7 @@ def build_ytd_year_figure() -> go.Figure | None:
     ytd_end = (today + dt.timedelta(days=1)).isoformat()
 
     for ticker in YTD_TICKERS:
-        data = yf.download(ticker, start=ytd_start, end=ytd_end, progress=False)
+        data = yf.download(ticker, start=ytd_start, end=ytd_end, progress=False, auto_adjust=False)
 
         if len(data) < 2:
             print(f"{ticker} の {current_year} 年(YTD)のデータが不足しています")
@@ -777,7 +820,8 @@ def build_ytd_year_figure() -> go.Figure | None:
 
         open_price = data.iloc[0]["Open"]     # 今年最初の営業日の始値
         close_price = data.iloc[-1]["Close"]  # 現在時点での直近営業日の終値
-        ytd_return = float((close_price / open_price - 1) * 100)
+        #ytd_return = float((close_price / open_price - 1) * 100)
+        ytd_return = float(((close_price / open_price - 1) * 100).iloc[0])
 
         records.append({
             "Year": current_year,
@@ -936,7 +980,7 @@ def main():
                 cols = st.columns(n_cols)
             col = cols[idx % n_cols]
             with col:
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width='content')
 
     # ===== Indexes セクション =====
     st.markdown("## Indexes")
@@ -954,7 +998,7 @@ def main():
                 cols = st.columns(n_cols)
             col = cols[idx % n_cols]
             with col:
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width='content')
 
     # ===== その他（YTD）セクション =====
     st.markdown("## Others")
@@ -963,12 +1007,12 @@ def main():
     if fig_ytd is not None:
         # misc_cols = st.columns(3)
         # with misc_cols[0]:
-        #     st.plotly_chart(fig_ytd, use_container_width=True)
+        #     st.plotly_chart(fig_ytd, width='content')
         col_left, col_right = st.columns([1, 2])
         with col_left:
-            st.plotly_chart(fig_ytd, use_container_width=True)
+            st.plotly_chart(fig_ytd, width='content')
         with col_right:
-            st.plotly_chart(fig_ytd_year, use_container_width=True)
+            st.plotly_chart(fig_ytd_year, width='content')
 
 
 if __name__ == "__main__":
